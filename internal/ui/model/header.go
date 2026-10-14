@@ -61,7 +61,9 @@ func (h *header) refresh() {
 	h.logo = ""
 }
 
-// drawHeader draws the header for the given session.
+// drawHeader draws the header for the given session. lspErrorCount comes
+// from the UI's memoized LSP state: drawing runs on every frame and must not
+// probe the workspace (a synchronous HTTP round-trip in client/server mode).
 func (h *header) drawHeader(
 	scr uv.Screen,
 	area uv.Rectangle,
@@ -69,7 +71,9 @@ func (h *header) drawHeader(
 	compact bool,
 	detailsOpen bool,
 	width int,
+	lspErrorCount int,
 	hyperCredits *int,
+	gitBranch string,
 ) {
 	t := h.com.Styles
 	if width != h.width || compact != h.compact {
@@ -92,10 +96,6 @@ func (h *header) drawHeader(
 	b.WriteString(h.compactLogo)
 
 	availDetailWidth := width - leftPadding - rightPadding - lipgloss.Width(b.String()) - minHeaderDiags - diagToDetailsSpacing
-	lspErrorCount := 0
-	for _, info := range h.com.Workspace.LSPGetStates() {
-		lspErrorCount += info.DiagnosticCount
-	}
 	details := renderHeaderDetails(
 		h.com,
 		session,
@@ -103,6 +103,7 @@ func (h *header) drawHeader(
 		detailsOpen,
 		availDetailWidth,
 		hyperCredits,
+		gitBranch,
 	)
 
 	remainingWidth := width -
@@ -135,6 +136,7 @@ func renderHeaderDetails(
 	detailsOpen bool,
 	availWidth int,
 	hyperCredits *int,
+	gitBranch string,
 ) string {
 	t := com.Styles
 
@@ -173,8 +175,20 @@ func renderHeaderDetails(
 	metadata = dot + metadata
 
 	const dirTrimLimit = 4
-	cwd := fsext.DirTrim(fsext.PrettyPath(com.Workspace.WorkingDir()), dirTrimLimit)
-	cwd = t.Header.WorkingDir.Render(cwd)
+	workingDir := com.Workspace.WorkingDir()
+	cwd := t.Header.WorkingDir.Render(fsext.DirTrim(fsext.PrettyPath(workingDir), dirTrimLimit))
+
+	if gitBranch != "" {
+		// Reserve space for the dot separator between branch and path and
+		// at least some of the path.
+		branchSep := t.Header.Separator.Render(" • ")
+		metadataWidth := lipgloss.Width(metadata)
+		maxBranchWidth := max(0, availWidth-metadataWidth-lipgloss.Width(cwd)-lipgloss.Width(branchSep))
+		if maxBranchWidth > 0 {
+			truncBranch := ansi.Truncate(gitBranch, maxBranchWidth, "…")
+			cwd = t.Header.GitBranch.Render(truncBranch) + branchSep + cwd
+		}
+	}
 
 	result := cwd + metadata
 	return ansi.Truncate(result, max(0, availWidth), "…")

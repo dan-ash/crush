@@ -30,9 +30,17 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameFile(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return nil
+}
+
+// renameFile renames tmp over path. On Windows the rename fails with
+// ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION while another process
+// (antivirus, search indexer) or a concurrent reader briefly holds a
+// handle on the destination, so transient failures are retried.
+func renameFile(tmp, path string) error {
+	return retryTransient(func() error { return os.Rename(tmp, path) })
 }

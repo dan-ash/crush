@@ -76,7 +76,7 @@ func TestCancel_ActiveAndAcceptedFiresBothBranches(t *testing.T) {
 
 	const sid = "sid"
 	var activeCanceled atomic.Bool
-	sa.activeRequests.Set(sid, func() { activeCanceled.Store(true) })
+	sa.activeRequests.Set(sid, &activeCancel{cancel: func() { activeCanceled.Store(true) }})
 
 	accept := sa.BeginAccepted(sid)
 	defer accept.Close()
@@ -100,7 +100,7 @@ func TestRun_BusyWithPendingCancelTakesCancelOnEntry(t *testing.T) {
 	require.NoError(t, err)
 
 	// Make the session look busy: an earlier prompt is active.
-	sa.activeRequests.Set(sess.ID, func() {})
+	sa.activeRequests.Set(sess.ID, &activeCancel{cancel: func() {}})
 
 	accept := sa.BeginAccepted(sess.ID)
 	// A cancel arrives while this follow-up is accepted-but-not-active.
@@ -257,6 +257,33 @@ func TestRun_CancelOnEntryPublishesRunComplete(t *testing.T) {
 			"cancel-on-entry RunComplete must be marked cancelled")
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancel-on-entry must publish RunComplete; a RunID caller would hang otherwise")
+	}
+}
+
+// A run that fails while setting up, after it became active, still ends
+// with RunComplete; observers would otherwise think the session busy.
+func TestRun_SetupFailurePublishesRunComplete(t *testing.T) {
+	t.Parallel()
+	sa, _, broker := newCancelTestAgentWithRunComplete(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ch := broker.Subscribe(ctx)
+
+	_, err := sa.Run(t.Context(), SessionAgentCall{
+		SessionID: "missing",
+		RunID:     "run-setup-failure",
+		Prompt:    "hello",
+	})
+	require.Error(t, err)
+
+	select {
+	case got := <-ch:
+		assert.Equal(t, "run-setup-failure", got.Payload.RunID)
+		assert.NotEmpty(t, got.Payload.Error)
+		assert.False(t, got.Payload.Cancelled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a run that failed during setup must publish RunComplete")
 	}
 }
 

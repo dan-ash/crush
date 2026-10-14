@@ -234,6 +234,12 @@ func decodeSSEEnvelope(p pubsub.Payload) (any, bool) {
 			return nil, false
 		}
 		return e, true
+	case pubsub.PayloadTypeQuestionNotification:
+		var e pubsub.Event[proto.QuestionNotification]
+		if err := json.Unmarshal(p.Payload, &e); err != nil {
+			return nil, false
+		}
+		return e, true
 	case pubsub.PayloadTypeMessage:
 		var e pubsub.Event[proto.Message]
 		if err := json.Unmarshal(p.Payload, &e); err != nil {
@@ -254,6 +260,22 @@ func decodeSSEEnvelope(p pubsub.Payload) (any, bool) {
 		return e, true
 	}
 	return nil, false
+}
+
+// setCurrentSession reports the session the given client is viewing
+// via the HTTP surface, mirroring the TUI's session-switch report.
+func (h *e2eHarness) setCurrentSession(t *testing.T, ctx context.Context, workspaceID, clientID, sessionID string) {
+	t.Helper()
+	body, err := json.Marshal(proto.CurrentSession{SessionID: sessionID})
+	require.NoError(t, err)
+	reqURL := h.httpSrv.URL + "/v1/workspaces/" + workspaceID + "/current-session?client_id=" + clientID
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	require.NoError(t, err)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := h.httpSrv.Client().Do(httpReq)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
 // grantPermission posts a permission grant via the HTTP surface and
@@ -336,10 +358,15 @@ func drainUntil[T any](ctx context.Context, evc <-chan any, match func(T) bool) 
 // config.Init does not read the host machine's real config.
 func TestE2E_TwoClientsReceiveSameMessage(t *testing.T) {
 	h := newRealCreateHarness(t)
-	// Shorten the create-grace window so the workspace's pending
-	// creation holds release quickly during test cleanup once both
-	// SSE streams have been detached.
+	// Shorten the lifecycle windows so the workspace's client holds
+	// release quickly during test cleanup once both SSE streams have
+	// been detached: the create grace covers the window before the
+	// streams attach, the detach grace the window after they drop.
+	// The pooled DB connection is only released once the last hold
+	// expires, and Windows cannot remove the temp data directory
+	// while that connection is still open.
 	h.backend.SetCreateGrace(200 * time.Millisecond)
+	h.backend.SetDetachGrace(200 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
@@ -437,6 +464,13 @@ func TestE2E_PermissionFlowCrossClient(t *testing.T) {
 	// Drive the permission request from a goroutine simulating the
 	// tool path. Request blocks until resolved; capture the outcome.
 	const sessionID = "s-perm"
+
+	// Permission prompts are session-scoped: only clients viewing the
+	// session observe the request. Both clients view it here, which
+	// is what makes the cross-client flow below possible at all.
+	h.setCurrentSession(t, ctx, h.workspace.ID, cidA, sessionID)
+	h.setCurrentSession(t, ctx, h.workspace.ID, cidB, sessionID)
+
 	const toolCallID = "tc-1"
 	type result struct {
 		granted bool
@@ -457,7 +491,9 @@ func TestE2E_PermissionFlowCrossClient(t *testing.T) {
 
 	// Wait for the PermissionRequest to arrive on client A's SSE
 	// stream. We need its ID to drive the grant.
-	pickCtx, pickCancel := context.WithTimeout(ctx, 3*time.Second)
+	// 10s instead of the 3s used elsewhere because this context
+	// bounds three sequential waits, not one.
+	pickCtx, pickCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer pickCancel()
 	reqEv, ok := drainUntil(pickCtx, evcA, func(e pubsub.Event[proto.PermissionRequest]) bool {
 		return e.Payload.ToolCallID == toolCallID
@@ -498,6 +534,90 @@ func TestE2E_PermissionFlowCrossClient(t *testing.T) {
 		Action:     proto.PermissionAllow,
 	})
 	require.False(t, resolvedB, "client B's follow-up grant must report already resolved")
+}
+
+// TestE2E_PermissionScopedToViewingClients verifies that permission
+// prompts are routed only to clients viewing the owning session: a
+// request raised while a client views another session never reaches
+// that client's stream, and switching into the owning session
+// re-delivers the still-pending request. Viewers of the same session
+// both observe the resolution notification.
+func TestE2E_PermissionScopedToViewingClients(t *testing.T) {
+	t.Parallel()
+	h := newE2EHarness(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	cidA := uuid.New().String()
+	cidB := uuid.New().String()
+
+	evcA, cancelA := h.subscribeSSE(t, ctx, h.workspace.ID, cidA)
+	t.Cleanup(cancelA)
+	evcB, cancelB := h.subscribeSSE(t, ctx, h.workspace.ID, cidB)
+	t.Cleanup(cancelB)
+
+	h.waitForAttached(t, 2)
+
+	const sessionA = "s-a"
+	const sessionB = "s-b"
+	h.setCurrentSession(t, ctx, h.workspace.ID, cidA, sessionA)
+	h.setCurrentSession(t, ctx, h.workspace.ID, cidB, sessionB)
+
+	const toolCallID = "tc-scoped"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = h.app.Permissions.Request(ctx, permission.CreatePermissionRequest{
+			SessionID:   sessionA,
+			ToolCallID:  toolCallID,
+			ToolName:    "view",
+			Description: "read a file",
+			Action:      "read",
+			Path:        h.workspace.Path,
+		})
+	}()
+	// Unblock the request on failure paths before waiting on done.
+	t.Cleanup(func() { cancel(); <-done })
+
+	// The client viewing the owning session receives the request.
+	reqCtx, reqCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer reqCancel()
+	reqEv, ok := drainUntil(reqCtx, evcA, func(e pubsub.Event[proto.PermissionRequest]) bool {
+		return e.Payload.ToolCallID == toolCallID
+	})
+	require.True(t, ok, "client viewing the owning session must receive the request")
+
+	// The client viewing another session must not. A 500ms absence
+	// window is generous given the in-process transport.
+	absCtx, absCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer absCancel()
+	_, leaked := drainUntil(absCtx, evcB, func(e pubsub.Event[proto.PermissionRequest]) bool {
+		return e.Payload.ToolCallID == toolCallID
+	})
+	require.False(t, leaked, "client viewing another session must not receive the request")
+
+	// Switching client B into the owning session re-publishes the
+	// still-pending request.
+	h.setCurrentSession(t, ctx, h.workspace.ID, cidB, sessionA)
+	repub, ok := drainUntil(reqCtx, evcB, func(e pubsub.Event[proto.PermissionRequest]) bool {
+		return e.Payload.ToolCallID == toolCallID
+	})
+	require.True(t, ok, "switching into the owning session must re-deliver the pending request")
+	require.Equal(t, reqEv.Payload.ID, repub.Payload.ID, "re-delivery must carry the same pending request")
+
+	// Both viewers observe the resolution notification.
+	resolved := h.grantPermission(t, ctx, h.workspace.ID, proto.PermissionGrant{
+		Permission: reqEv.Payload,
+		Action:     proto.PermissionAllow,
+	})
+	require.True(t, resolved)
+	<-done
+	for i, evc := range []<-chan any{evcA, evcB} {
+		_, ok := drainUntil(reqCtx, evc, func(e pubsub.Event[proto.PermissionNotification]) bool {
+			return e.Payload.ToolCallID == toolCallID && e.Payload.Granted
+		})
+		require.True(t, ok, "viewer %d must receive the granting notification", i)
+	}
 }
 
 // TestE2E_KillingClientASSEDoesNotBreakClientB covers PLAN item 6
@@ -561,10 +681,16 @@ func TestE2E_KillingClientASSEDoesNotBreakClientB(t *testing.T) {
 
 // TestE2E_ShutdownCallbackFiresWhenLastClientLeaves covers PLAN
 // item 6 scenario 4: once both clients disconnect, the backend
-// runs its "last workspace removed -> server shutdown" path.
+// runs its "last workspace removed -> server shutdown" path — now
+// after the idle-linger window rather than immediately.
 func TestE2E_ShutdownCallbackFiresWhenLastClientLeaves(t *testing.T) {
 	t.Parallel()
 	h := newE2EHarness(t)
+	// Shorten both lifecycle windows so the test doesn't wait out the
+	// production values. Both stay non-zero, so teardown still travels the
+	// real path: detach grace, then idle linger.
+	h.backend.SetDetachGrace(100 * time.Millisecond)
+	h.backend.SetIdleShutdownDelay(200 * time.Millisecond)
 
 	ctxA, cancelA := context.WithCancel(t.Context())
 	ctxB, cancelB := context.WithCancel(t.Context())
@@ -593,7 +719,8 @@ func TestE2E_ShutdownCallbackFiresWhenLastClientLeaves(t *testing.T) {
 	killB()
 	require.Eventually(t, h.shutdownHit.Load,
 		3*time.Second, 10*time.Millisecond,
-		"shutdown callback must fire once the last client disconnects")
+		"shutdown callback must fire once the last client disconnects "+
+			"(after the detach grace and the idle linger)")
 
 	// Workspace must be gone from the index.
 	_, err := h.backend.GetWorkspace(h.workspace.ID)

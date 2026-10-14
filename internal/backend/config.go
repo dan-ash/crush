@@ -9,6 +9,7 @@ import (
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/gitutil"
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -17,11 +18,20 @@ import (
 
 // publishConfigChanged publishes a ConfigChanged event on the workspace's
 // event broker so all subscribers (e.g. remote clients) refresh their
-// cached config snapshot.
+// cached config snapshot. It also re-initializes any MCP servers whose
+// configuration changed as a result of the write.
 func publishConfigChanged(ws *Workspace) {
 	if ws == nil || ws.App == nil {
 		return
 	}
+
+	// Re-init MCP servers whose config changed. MCP state is process-global,
+	// so this only needs to happen once regardless of which workspace
+	// triggered the write. Run async so unrelated config writes (model
+	// switches, API keys) don't block on MCP reconciliation. Bound to the
+	// workspace ctx so teardown cancels any in-flight init.
+	go mcptools.Reinitialize(ws.ctx, ws.Cfg)
+
 	ws.SendEvent(pubsub.Event[proto.ConfigChanged]{
 		Type:    pubsub.UpdatedEvent,
 		Payload: proto.ConfigChanged{WorkspaceID: ws.ID},
@@ -163,6 +173,17 @@ func (b *Backend) InitializePrompt(workspaceID string) (string, error) {
 	return agent.InitializePrompt(ws.Cfg)
 }
 
+// GitBranch returns the current Git branch of the workspace's working
+// directory, or an empty string when it is not a Git repository or HEAD
+// is detached.
+func (b *Backend) GitBranch(workspaceID string) (string, error) {
+	ws, err := b.GetWorkspace(workspaceID)
+	if err != nil {
+		return "", err
+	}
+	return gitutil.CurrentBranch(ws.Cfg.WorkingDir()), nil
+}
+
 // ReadSkill reads a skill's content by ID.
 func (b *Backend) ReadSkill(ctx context.Context, workspaceID, skillID string) ([]byte, proto.SkillReadResult, error) {
 	ws, err := b.GetWorkspace(workspaceID)
@@ -295,6 +316,37 @@ func (b *Backend) GetMCPPrompt(workspaceID, clientID, promptID string, args map[
 		return "", err
 	}
 	return commands.GetMCPPrompt(ws.Cfg, clientID, promptID, args)
+}
+
+func (b *Backend) ListMCPPrompts(workspaceID string) ([]proto.MCPPrompt, error) {
+	if _, err := b.GetWorkspace(workspaceID); err != nil {
+		return nil, err
+	}
+	prompts, err := commands.LoadMCPPrompts()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]proto.MCPPrompt, len(prompts))
+	for i, prompt := range prompts {
+		arguments := make([]proto.MCPPromptArgument, len(prompt.Arguments))
+		for j, argument := range prompt.Arguments {
+			arguments[j] = proto.MCPPromptArgument{
+				ID:          argument.ID,
+				Title:       argument.Title,
+				Description: argument.Description,
+				Required:    argument.Required,
+			}
+		}
+		result[i] = proto.MCPPrompt{
+			ID:          prompt.ID,
+			Title:       prompt.Title,
+			Description: prompt.Description,
+			PromptID:    prompt.PromptID,
+			ClientID:    prompt.ClientID,
+			Arguments:   arguments,
+		}
+	}
+	return result, nil
 }
 
 // GetWorkingDir returns the working directory for a workspace.

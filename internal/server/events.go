@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 )
@@ -37,14 +39,24 @@ func wrapEvent(ev any) *pubsub.Payload {
 			},
 		})
 	case pubsub.Event[mcp.Event]:
+		pt := mcpEventTypeToProto(e.Payload.Type)
+		if pt == "" {
+			// Unsupported MCP event type. Drop it instead of fabricating
+			// a state_changed event.
+			slog.Debug("Dropping unsupported MCP event type for SSE", "type", e.Payload.Type)
+			return nil
+		}
 		return envelope(pubsub.PayloadTypeMCPEvent, pubsub.Event[proto.MCPEvent]{
 			Type: e.Type,
 			Payload: proto.MCPEvent{
-				Type:      mcpEventTypeToProto(e.Payload.Type),
-				Name:      e.Payload.Name,
-				State:     proto.MCPState(e.Payload.State),
-				Error:     e.Payload.Error,
-				ToolCount: e.Payload.Counts.Tools,
+				Type:           pt,
+				Name:           e.Payload.Name,
+				State:          proto.MCPState(e.Payload.State),
+				Error:          e.Payload.Error,
+				ToolCount:      e.Payload.Counts.Tools,
+				PromptCount:    e.Payload.Counts.Prompts,
+				ResourceCount:  e.Payload.Counts.Resources,
+				ChannelMessage: e.Payload.ChannelMessage,
 			},
 		})
 	case pubsub.Event[permission.PermissionRequest]:
@@ -65,9 +77,31 @@ func wrapEvent(ev any) *pubsub.Payload {
 		return envelope(pubsub.PayloadTypePermissionNotification, pubsub.Event[proto.PermissionNotification]{
 			Type: e.Type,
 			Payload: proto.PermissionNotification{
+				SessionID:  e.Payload.SessionID,
 				ToolCallID: e.Payload.ToolCallID,
 				Granted:    e.Payload.Granted,
 				Denied:     e.Payload.Denied,
+			},
+		})
+	case pubsub.Event[question.Request]:
+		slog.Info("Wrapping question batch event for SSE", "id", e.Payload.ID, "questions", len(e.Payload.Questions))
+		return envelope(pubsub.PayloadTypeQuestionRequest, pubsub.Event[proto.QuestionRequest]{
+			Type: e.Type,
+			Payload: proto.QuestionRequest{
+				ID:                 e.Payload.ID,
+				SessionID:          e.Payload.SessionID,
+				ToolCallID:         e.Payload.ToolCallID,
+				Questions:          questionsToProto(e.Payload.Questions),
+				ConfirmTitle:       e.Payload.ConfirmTitle,
+				ConfirmDescription: e.Payload.ConfirmDescription,
+			},
+		})
+	case pubsub.Event[question.Notification]:
+		return envelope(pubsub.PayloadTypeQuestionNotification, pubsub.Event[proto.QuestionNotification]{
+			Type: e.Type,
+			Payload: proto.QuestionNotification{
+				BatchID:   e.Payload.BatchID,
+				SessionID: e.Payload.SessionID,
 			},
 		})
 	case pubsub.Event[message.Message]:
@@ -91,10 +125,16 @@ func wrapEvent(ev any) *pubsub.Payload {
 			SessionTitle: e.Payload.SessionTitle,
 			RunID:        e.Payload.RunID,
 			Type:         proto.AgentEventType(e.Payload.Type),
+			AWSSOCommand: e.Payload.AWSSOCommand,
+			AWSSOURL:     e.Payload.AWSSOURL,
+		}
+		// Carry any human-readable message across the wire; the client
+		// maps Error back into Notification.Message.
+		if e.Payload.Message != "" {
+			payload.Error = errors.New(e.Payload.Message)
 		}
 		if e.Payload.Type == notify.TypeAgentError {
 			payload.Type = proto.AgentEventTypeError
-			payload.Error = errors.New(e.Payload.Message)
 		}
 		return envelope(pubsub.PayloadTypeAgentEvent, pubsub.Event[proto.AgentEvent]{
 			Type:    e.Type,
@@ -114,6 +154,15 @@ func wrapEvent(ev any) *pubsub.Payload {
 		})
 	case pubsub.Event[proto.ConfigChanged]:
 		return envelope(pubsub.PayloadTypeConfigChanged, e)
+	case app.UpdateAvailableMsg:
+		return envelope(pubsub.PayloadTypeUpdateAvailable, pubsub.Event[proto.UpdateAvailable]{
+			Type: pubsub.UpdatedEvent,
+			Payload: proto.UpdateAvailable{
+				CurrentVersion: e.CurrentVersion,
+				LatestVersion:  e.LatestVersion,
+				IsDevelopment:  e.IsDevelopment,
+			},
+		})
 	case pubsub.Event[skills.Event]:
 		return envelope(pubsub.PayloadTypeSkillsEvent, pubsub.Event[proto.SkillsEvent]{
 			Type:    e.Type,
@@ -123,6 +172,71 @@ func wrapEvent(ev any) *pubsub.Payload {
 		slog.Warn("Unrecognized event type for SSE wrapping", "type", fmt.Sprintf("%T", ev))
 		return nil
 	}
+}
+
+// sessionScopedEventID extracts the session ID from events that
+// belong to a single session's interactive prompts (permission and
+// question requests and their resolution notifications). The second
+// return value reports whether the event is session-scoped at all. An
+// event whose session ID is empty is treated as unscoped: it cannot
+// match any client's current session, so scoping it would drop it for
+// everyone.
+func sessionScopedEventID(ev any) (string, bool) {
+	var id string
+	switch e := ev.(type) {
+	case pubsub.Event[permission.PermissionRequest]:
+		id = e.Payload.SessionID
+	case pubsub.Event[permission.PermissionNotification]:
+		id = e.Payload.SessionID
+	case pubsub.Event[question.Request]:
+		id = e.Payload.SessionID
+	case pubsub.Event[question.Notification]:
+		id = e.Payload.SessionID
+	default:
+		return "", false
+	}
+	return id, id != ""
+}
+
+// deliverToClient reports whether a workspace event should be written
+// to the given client's SSE stream. Session-scoped prompt events are
+// only delivered to clients currently viewing the session that raised
+// them: a permission dialog or question form is only actionable there,
+// and broadcasting it to every client in the workspace lets sessions
+// steal each other's prompts. Prompts raised by sub-agent sessions
+// (agent tool, agentic fetch) resolve to the top-level session so the
+// viewer of the parent session can answer them. Clients on the landing
+// screen (an explicitly cleared session) receive no prompts, while
+// clients that never reported a session at all (e.g. API clients
+// predating session reporting) fail open so their prompts are not
+// stranded. All other events are delivered unfiltered.
+func (c *controllerV1) deliverToClient(ctx context.Context, workspaceID, clientID string, ev any) bool {
+	sessionID, scoped := sessionScopedEventID(ev)
+	if !scoped {
+		return true
+	}
+	current, reported := c.backend.ClientCurrentSession(workspaceID, clientID)
+	if !reported {
+		// The client never reported a current session, so there is
+		// nothing to scope against. Fail open rather than stranding a
+		// prompt nobody can answer.
+		return true
+	}
+	if current == "" {
+		return false
+	}
+	if sessionID == current {
+		return true
+	}
+	root, err := c.backend.RootSessionID(ctx, workspaceID, sessionID)
+	if err != nil {
+		// Fail open: an unresolvable session is delivered as before
+		// rather than stranding a prompt nobody can answer.
+		slog.Debug("Failed to resolve root session for event routing",
+			"session_id", sessionID, "error", err)
+		return true
+	}
+	return root == current
 }
 
 // envelope marshals the inner event and wraps it in a pubsub.Payload.
@@ -148,8 +262,12 @@ func mcpEventTypeToProto(t mcp.EventType) proto.MCPEventType {
 		return proto.MCPEventPromptsListChanged
 	case mcp.EventResourcesListChanged:
 		return proto.MCPEventResourcesListChanged
+	case mcp.EventChannelMessage:
+		return proto.MCPEventChannelMessage
 	default:
-		return proto.MCPEventStateChanged
+		// Unsupported type. Return empty so callers can drop it rather
+		// than coercing to state_changed.
+		return ""
 	}
 }
 
@@ -164,6 +282,7 @@ func sessionToProto(s session.Session) proto.Session {
 		CompletionTokens: s.CompletionTokens,
 		Cost:             s.Cost,
 		Todos:            todosToProto(s.Todos),
+		Channel:          s.Channel,
 		CreatedAt:        s.CreatedAt,
 		UpdatedAt:        s.UpdatedAt,
 	}
@@ -221,19 +340,24 @@ func fileToProto(f history.File) proto.File {
 
 func messageToProto(m message.Message) proto.Message {
 	msg := proto.Message{
-		ID:        m.ID,
-		SessionID: m.SessionID,
-		Role:      proto.MessageRole(m.Role),
-		Model:     m.Model,
-		Provider:  m.Provider,
-		CreatedAt: m.CreatedAt,
-		UpdatedAt: m.UpdatedAt,
+		ID:                      m.ID,
+		SessionID:               m.SessionID,
+		Role:                    proto.MessageRole(m.Role),
+		Model:                   m.Model,
+		Provider:                m.Provider,
+		PrismModelID:            m.PrismModelID,
+		PrismModelName:          m.PrismModelName,
+		PrismHypercreditSavings: m.PrismHypercreditSavings,
+		PrismDollarSavings:      m.PrismDollarSavings,
+		CreatedAt:               m.CreatedAt,
+		UpdatedAt:               m.UpdatedAt,
+		IsSummaryMessage:        m.IsSummaryMessage,
 	}
 
 	for _, p := range m.Parts {
 		switch v := p.(type) {
 		case message.TextContent:
-			msg.Parts = append(msg.Parts, proto.TextContent{Text: v.Text})
+			msg.Parts = append(msg.Parts, proto.TextContent{Text: v.Text, Hidden: v.Hidden})
 		case message.ReasoningContent:
 			msg.Parts = append(msg.Parts, proto.ReasoningContent{
 				Thinking:   v.Thinking,
@@ -306,6 +430,32 @@ func messagesToProto(msgs []message.Message) []proto.Message {
 	out := make([]proto.Message, len(msgs))
 	for i, m := range msgs {
 		out[i] = messageToProto(m)
+	}
+	return out
+}
+
+func questionsToProto(qs []question.Question) []proto.QuestionItem {
+	if len(qs) == 0 {
+		return nil
+	}
+	out := make([]proto.QuestionItem, len(qs))
+	for i, q := range qs {
+		choices := make([]proto.QuestionChoice, len(q.Choices))
+		for j, c := range q.Choices {
+			choices[j] = proto.QuestionChoice{
+				ID:          c.ID,
+				Label:       c.Label,
+				Description: c.Description,
+			}
+		}
+		out[i] = proto.QuestionItem{
+			ID:          q.ID,
+			Type:        string(q.Type),
+			Label:       q.Label,
+			Question:    q.Text,
+			Description: q.Description,
+			Choices:     choices,
+		}
 	}
 	return out
 }
